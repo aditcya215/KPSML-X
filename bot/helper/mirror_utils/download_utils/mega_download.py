@@ -6,8 +6,10 @@ from mega import MegaApi, MegaListener, MegaRequest, MegaTransfer, MegaError
 
 try:
     from mega import MegaProxy
+    # Verify the attribute actually exists in this SDK version
+    _ = MegaProxy.PROXY_CUSTOM
     _MEGA_PROXY_AVAILABLE = True
-except ImportError:
+except (ImportError, AttributeError):
     _MEGA_PROXY_AVAILABLE = False
 
 from bot import LOGGER, config_dict, download_dict_lock, download_dict, non_queued_dl, queue_dict_lock
@@ -133,16 +135,19 @@ def _apply_mega_proxy(api, mega_proxy_url):
     if not mega_proxy_url:
         return False
     if _MEGA_PROXY_AVAILABLE:
-        proxy = MegaProxy()
-        proxy.setType(MegaProxy.PROXY_CUSTOM)
-        proxy.setURL(mega_proxy_url)
-        api.setProxySettings(proxy)
-    else:
-        from os import environ as _env
-        _env['http_proxy'] = mega_proxy_url
-        _env['https_proxy'] = mega_proxy_url
-        _env['HTTP_PROXY'] = mega_proxy_url
-        _env['HTTPS_PROXY'] = mega_proxy_url
+        try:
+            proxy = MegaProxy()
+            proxy.setType(MegaProxy.PROXY_CUSTOM)
+            proxy.setURL(mega_proxy_url)
+            api.setProxySettings(proxy)
+            return True
+        except AttributeError as e:
+            LOGGER.warning(f"MegaProxy SDK error ({e}), falling back to environment variables")
+    from os import environ as _env
+    _env['http_proxy'] = mega_proxy_url
+    _env['https_proxy'] = mega_proxy_url
+    _env['HTTP_PROXY'] = mega_proxy_url
+    _env['HTTPS_PROXY'] = mega_proxy_url
     return True
 
 
@@ -155,85 +160,95 @@ async def add_mega_download(mega_link, path, listener, name):
     api = MegaApi(None, None, None, 'KPSML-X')
     folder_api = None
 
-    if _apply_mega_proxy(api, MEGA_PROXY):
-        from urllib.parse import urlsplit as _urlsplit
-        _parts = _urlsplit(MEGA_PROXY)
-        LOGGER.info(
-            f"MEGA proxy mode enabled: "
-            f"{_parts.scheme or '?'}://{_parts.hostname or '?'}:{_parts.port or '?'}"
-        )
+    try:
+        if _apply_mega_proxy(api, MEGA_PROXY):
+            from urllib.parse import urlsplit as _urlsplit
+            _parts = _urlsplit(MEGA_PROXY)
+            LOGGER.info(
+                f"MEGA proxy mode enabled: "
+                f"{_parts.scheme or '?'}://{_parts.hostname or '?'}:{_parts.port or '?'}"
+            )
 
-    mega_listener = MegaAppListener(executor.continue_event, listener)
-    api.addListener(mega_listener)
+        mega_listener = MegaAppListener(executor.continue_event, listener)
+        api.addListener(mega_listener)
 
-    if MEGA_EMAIL and MEGA_PASSWORD:
-        await executor.do(api.login, (MEGA_EMAIL, MEGA_PASSWORD))
+        if MEGA_EMAIL and MEGA_PASSWORD:
+            await executor.do(api.login, (MEGA_EMAIL, MEGA_PASSWORD))
 
-    if get_mega_link_type(mega_link) == "file":
-        await executor.do(api.getPublicNode, (mega_link,))
-        node = mega_listener.public_node
-    else:
-        folder_api = MegaApi(None, None, None, 'KPSML-X')
-        if MEGA_PROXY:
-            _apply_mega_proxy(folder_api, MEGA_PROXY)
-        folder_api.addListener(mega_listener)
-        await executor.do(folder_api.loginToFolder, (mega_link,))
-        node = await sync_to_async(folder_api.authorizeNode, mega_listener.node)
-    if mega_listener.error is not None:
-        await sendMessage(listener.message, str(mega_listener.error))
+        if get_mega_link_type(mega_link) == "file":
+            await executor.do(api.getPublicNode, (mega_link,))
+            node = mega_listener.public_node
+        else:
+            folder_api = MegaApi(None, None, None, 'KPSML-X')
+            if MEGA_PROXY:
+                _apply_mega_proxy(folder_api, MEGA_PROXY)
+            folder_api.addListener(mega_listener)
+            await executor.do(folder_api.loginToFolder, (mega_link,))
+            node = await sync_to_async(folder_api.authorizeNode, mega_listener.node)
+        if mega_listener.error is not None:
+            await sendMessage(listener.message, str(mega_listener.error))
+            await executor.do(api.logout, ())
+            if folder_api is not None:
+                await executor.do(folder_api.logout, ())
+            return
+        if node is None:
+            await sendMessage(listener.message, "Failed to retrieve MEGA node. The link may be invalid or expired.")
+            await executor.do(api.logout, ())
+            if folder_api is not None:
+                await executor.do(folder_api.logout, ())
+            return
+
+        name = name or node.getName()
+        msg, button = await stop_duplicate_check(name, listener)
+        if msg:
+            await sendMessage(listener.message, msg, button)
+            await executor.do(api.logout, ())
+            if folder_api is not None:
+                await executor.do(folder_api.logout, ())
+            return
+
+        gid = token_hex(5)
+        size = api.getSize(node)
+        if limit_exceeded := await limit_checker(size, listener, isMega=True):
+            await sendMessage(listener.message, limit_exceeded)
+            return
+        added_to_queue, event = await is_queued(listener.uid)
+        if added_to_queue:
+            LOGGER.info(f'Added to Queue/Download: {name}')
+            async with download_dict_lock:
+                download_dict[listener.uid] = QueueStatus(
+                    name, size, gid, listener, 'Dl')
+            await listener.onDownloadStart()
+            await sendStatusMessage(listener.message)
+            await event.wait()
+            async with download_dict_lock:
+                if listener.uid not in download_dict:
+                    await executor.do(api.logout, ())
+                    if folder_api is not None:
+                        await executor.do(folder_api.logout, ())
+                    return
+            from_queue = True
+            LOGGER.info(f'Start Queued Download from Mega: {name}')
+        else:
+            from_queue = False
+
+        async with download_dict_lock:
+            download_dict[listener.uid] = MegaDownloadStatus(name, size, gid, mega_listener, listener.message, listener.upload_details)
+        async with queue_dict_lock:
+            non_queued_dl.add(listener.uid)
+
+        if from_queue:
+            LOGGER.info(f'Start Queued Download from Mega: {name}')
+        else:
+            await listener.onDownloadStart()
+            await sendStatusMessage(listener.message)
+            LOGGER.info(f'Download from Mega: {name}')
+
+        await makedirs(path, exist_ok=True)
+        await executor.do(api.startDownload, (node, path, name, None, False, None))
         await executor.do(api.logout, ())
         if folder_api is not None:
             await executor.do(folder_api.logout, ())
-        return
-
-    name = name or node.getName()
-    msg, button = await stop_duplicate_check(name, listener)
-    if msg:
-        await sendMessage(listener.message, msg, button)
-        await executor.do(api.logout, ())
-        if folder_api is not None:
-            await executor.do(folder_api.logout, ())
-        return
-
-    gid = token_hex(5)
-    size = api.getSize(node)
-    if limit_exceeded := await limit_checker(size, listener, isMega=True):
-        await sendMessage(listener.message, limit_exceeded)
-        return
-    added_to_queue, event = await is_queued(listener.uid)
-    if added_to_queue:
-        LOGGER.info(f"Added to Queue/Download: {name}")
-        async with download_dict_lock:
-            download_dict[listener.uid] = QueueStatus(
-                name, size, gid, listener, 'Dl')
-        await listener.onDownloadStart()
-        await sendStatusMessage(listener.message)
-        await event.wait()
-        async with download_dict_lock:
-            if listener.uid not in download_dict:
-                await executor.do(api.logout, ())
-                if folder_api is not None:
-                    await executor.do(folder_api.logout, ())
-                return
-        from_queue = True
-        LOGGER.info(f'Start Queued Download from Mega: {name}')
-    else:
-        from_queue = False
-
-    async with download_dict_lock:
-        download_dict[listener.uid] = MegaDownloadStatus(name, size, gid, mega_listener, listener.message, listener.upload_details)
-    async with queue_dict_lock:
-        non_queued_dl.add(listener.uid)
-
-    if from_queue:
-        LOGGER.info(f'Start Queued Download from Mega: {name}')
-    else:
-        await listener.onDownloadStart()
-        await sendStatusMessage(listener.message)
-        LOGGER.info(f"Download from Mega: {name}")
-
-    await makedirs(path, exist_ok=True)
-    await executor.do(api.startDownload, (node, path, name, None, False, None))
-    await executor.do(api.logout, ())
-    if folder_api is not None:
-        await executor.do(folder_api.logout, ())
+    except Exception as e:
+        LOGGER.error(f'Mega download unexpected error: {e}', exc_info=True)
+        await listener.onDownloadError(f"MEGA download failed: {e}")
