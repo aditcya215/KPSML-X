@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from random import choice as random_choice
 from secrets import token_hex
 from aiofiles.os import makedirs
 from asyncio import Event
@@ -28,6 +29,7 @@ class MegaAppListener(MegaListener):
         self.public_node = None
         self.listener = listener
         self.is_cancelled = False
+        self.is_quota_error = False
         self.error = None
         self.__bytes_transferred = 0
         self.__speed = 0
@@ -103,9 +105,13 @@ class MegaAppListener(MegaListener):
         self.error = errStr
         if not self.is_cancelled:
             self.is_cancelled = True
-            async_to_sync(self.listener.onDownloadError,
-                          f"TransferTempError: {errStr} ({filen})")
-            self.continue_event.set()
+            if 'quota' in errStr.lower():
+                self.is_quota_error = True
+                self.continue_event.set()
+            else:
+                async_to_sync(self.listener.onDownloadError,
+                              f"TransferTempError: {errStr} ({filen})")
+                self.continue_event.set()
 
     async def cancel_download(self):
         self.is_cancelled = True
@@ -133,35 +139,44 @@ def _apply_mega_proxy(api, mega_proxy_url):
     if not mega_proxy_url:
         return False
     if _MEGA_PROXY_AVAILABLE:
-        proxy = MegaProxy()
-        proxy.setType(MegaProxy.PROXY_CUSTOM)
-        proxy.setURL(mega_proxy_url)
-        api.setProxySettings(proxy)
-    else:
-        from os import environ as _env
-        _env['http_proxy'] = mega_proxy_url
-        _env['https_proxy'] = mega_proxy_url
-        _env['HTTP_PROXY'] = mega_proxy_url
-        _env['HTTPS_PROXY'] = mega_proxy_url
+        try:
+            proxy = MegaProxy()
+            if hasattr(proxy, 'setType') and hasattr(MegaProxy, 'PROXY_CUSTOM'):
+                proxy.setType(MegaProxy.PROXY_CUSTOM)
+            proxy.setURL(mega_proxy_url)
+            api.setProxySettings(proxy)
+            return True
+        except Exception as e:
+            LOGGER.warning(
+                f"MegaProxy SDK error ({e}), falling back to environment variables for {mega_proxy_url}"
+            )
+    from os import environ as _env
+    _env['http_proxy'] = mega_proxy_url
+    _env['https_proxy'] = mega_proxy_url
+    _env['HTTP_PROXY'] = mega_proxy_url
+    _env['HTTPS_PROXY'] = mega_proxy_url
     return True
 
 
 async def add_mega_download(mega_link, path, listener, name):
     MEGA_EMAIL = config_dict['MEGA_EMAIL']
     MEGA_PASSWORD = config_dict['MEGA_PASSWORD']
-    MEGA_PROXY = config_dict.get('MEGA_PROXY', '')
+    MEGA_PROXY_RAW = config_dict.get('MEGA_PROXY', '')
+
+    # Support comma-separated list of proxies; each is tried in turn on quota errors.
+    proxy_list = (
+        [p.strip() for p in MEGA_PROXY_RAW.split(',') if p.strip()]
+        if MEGA_PROXY_RAW.strip() else []
+    )
+    tried_proxies: set = set()
+    current_proxy = random_choice(proxy_list) if proxy_list else ''
 
     executor = AsyncExecutor()
     api = MegaApi(None, None, None, 'KPSML-X')
     folder_api = None
 
-    if _apply_mega_proxy(api, MEGA_PROXY):
-        from urllib.parse import urlsplit as _urlsplit
-        _parts = _urlsplit(MEGA_PROXY)
-        LOGGER.info(
-            f"MEGA proxy mode enabled: "
-            f"{_parts.scheme or '?'}://{_parts.hostname or '?'}:{_parts.port or '?'}"
-        )
+    if current_proxy and _apply_mega_proxy(api, current_proxy):
+        LOGGER.info(f"MEGA proxy mode enabled: {current_proxy}")
 
     mega_listener = MegaAppListener(executor.continue_event, listener)
     api.addListener(mega_listener)
@@ -174,8 +189,8 @@ async def add_mega_download(mega_link, path, listener, name):
         node = mega_listener.public_node
     else:
         folder_api = MegaApi(None, None, None, 'KPSML-X')
-        if MEGA_PROXY:
-            _apply_mega_proxy(folder_api, MEGA_PROXY)
+        if current_proxy:
+            _apply_mega_proxy(folder_api, current_proxy)
         folder_api.addListener(mega_listener)
         await executor.do(folder_api.loginToFolder, (mega_link,))
         node = await sync_to_async(folder_api.authorizeNode, mega_listener.node)
@@ -233,7 +248,45 @@ async def add_mega_download(mega_link, path, listener, name):
         LOGGER.info(f"Download from Mega: {name}")
 
     await makedirs(path, exist_ok=True)
-    await executor.do(api.startDownload, (node, path, name, None, False, None))
+
+    while True:
+        # Safety check: abort if the task was externally removed (e.g. user cancel).
+        async with download_dict_lock:
+            if listener.uid not in download_dict:
+                await executor.do(api.logout, ())
+                if folder_api is not None:
+                    await executor.do(folder_api.logout, ())
+                return
+
+        # Reset listener state for this download attempt.
+        mega_listener.is_cancelled = False
+        mega_listener.is_quota_error = False
+        mega_listener.error = None
+
+        await executor.do(api.startDownload, (node, path, name, None, False, None))
+
+        if mega_listener.is_quota_error:
+            if current_proxy:
+                tried_proxies.add(current_proxy)
+            remaining = [p for p in proxy_list if p not in tried_proxies]
+            if remaining:
+                current_proxy = random_choice(remaining)
+                LOGGER.warning(
+                    f"Quota exceeded, rotating to new proxy: {current_proxy}"
+                )
+                _apply_mega_proxy(api, current_proxy)
+                if folder_api is not None:
+                    _apply_mega_proxy(folder_api, current_proxy)
+                continue
+            LOGGER.error("Quota exceeded on all available proxies")
+            await listener.onDownloadError("Mega download failed: Over quota on all proxies")
+            await executor.do(api.logout, ())
+            if folder_api is not None:
+                await executor.do(folder_api.logout, ())
+            return
+
+        break
+
     await executor.do(api.logout, ())
     if folder_api is not None:
         await executor.do(folder_api.logout, ())
