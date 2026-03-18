@@ -95,23 +95,25 @@ class MegaAppListener(MegaListener):
         filen = transfer.getFileName()
         state = transfer.getState()
         errStr = error.toString()
-        LOGGER.error(
-            f'Mega download error in file {transfer} {filen}: {error}')
         if state in [1, 4]:
             # Sometimes MEGA (offical client) can't stream a node either and raises a temp failed error.
             # Don't break the transfer queue if transfer's in queued (1) or retrying (4) state [causes seg fault]
             return
+        if self.is_cancelled:
+            # Already handled; suppress duplicate error logs for the same transfer failure.
+            return
 
+        LOGGER.error(
+            f'Mega download error in file {transfer} {filen}: {error}')
         self.error = errStr
-        if not self.is_cancelled:
-            self.is_cancelled = True
-            if 'quota' in errStr.lower():
-                self.is_quota_error = True
-                self.continue_event.set()
-            else:
-                async_to_sync(self.listener.onDownloadError,
-                              f"TransferTempError: {errStr} ({filen})")
-                self.continue_event.set()
+        self.is_cancelled = True
+        if 'quota' in errStr.lower():
+            self.is_quota_error = True
+            self.continue_event.set()
+        else:
+            async_to_sync(self.listener.onDownloadError,
+                          f"TransferTempError: {errStr} ({filen})")
+            self.continue_event.set()
 
     async def cancel_download(self):
         self.is_cancelled = True
@@ -143,9 +145,11 @@ def _apply_mega_proxy(api, mega_proxy_url):
             proxy = MegaProxy()
             if hasattr(proxy, 'setType') and hasattr(MegaProxy, 'PROXY_CUSTOM'):
                 proxy.setType(MegaProxy.PROXY_CUSTOM)
-            proxy.setURL(mega_proxy_url)
-            api.setProxySettings(proxy)
-            return True
+            if hasattr(proxy, 'setURL'):
+                proxy.setURL(mega_proxy_url)
+                api.setProxySettings(proxy)
+                return True
+            # setURL not available in this SDK build; fall through to env vars.
         except Exception as e:
             LOGGER.warning(
                 f"MegaProxy SDK error ({e}), falling back to environment variables for {mega_proxy_url}"
