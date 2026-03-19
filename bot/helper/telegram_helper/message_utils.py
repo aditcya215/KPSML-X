@@ -296,8 +296,7 @@ async def update_all_messages(force=False):
         return
     async with status_reply_dict_lock:
         for chat_id in list(status_reply_dict.keys()):
-            entry = status_reply_dict.get(chat_id)
-            stored_msg = entry[0] if entry else None
+            stored_msg = status_reply_dict.get(chat_id, [None])[0]
             if stored_msg and not isinstance(stored_msg, str) and msg != stored_msg.text:
                 rmsg = await editMessage(stored_msg, msg, buttons, 'IMAGES')
                 if isinstance(rmsg, str) and rmsg.startswith('Telegram says: [400'):

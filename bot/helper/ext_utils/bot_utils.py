@@ -71,7 +71,7 @@ class setInterval:
             try:
                 await self.action()
             except Exception as e:
-                LOGGER.error(f"setInterval action error: {e}")
+                LOGGER.error(f"setInterval action error ({getattr(self.action, '__name__', self.action)}): {e}")
 
     def cancel(self):
         self.task.cancel()
