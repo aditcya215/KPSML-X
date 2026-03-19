@@ -1,38 +1,4 @@
-<div align=center>
 
-## KPSML-X: Ultimate Multi-Cloud Telegram Leech Bot
-
-<p>
-    <a href="https://github.com/Tamilupdates/KPSML-X">
-        <kbd>
-            <img src="https://graph.org/file/879239eb830dd6c00b07e.jpg" width="550" alt="KPSML-X Logo">
-        </kbd>
-    </a>
-</p>
-
-<a href="https://github.com/Tamilupdates/KPSML-X/fork"><img alt="Forks" src="https://img.shields.io/github/forks/Tamilupdates/KPSML-X?style=plastic&logo=git&color=orange&label=Forks"></a> <a href="https://hub.docker.com/r/nanthakps/kpsmlx"><img src="https://img.shields.io/docker/pulls/nanthakps/kpsmlx?style=plastic&logo=docker&label=Pulls" alt="Docker Pulls"></a>
-
-<!-- <a href="https://github.com/Tamilupdates/KPSML-X/stargazers"><img alt="Stars" src="https://img.shields.io/github/stars/Tamilupdates/KPSML-X?style=plastic&logo=github&color=FFD700&label=Stars"></a>
--->
-
-<a href="https://telegram.me/KPSBots"><img alt="Telegram Channel" img src="https://img.shields.io/badge/Join%20on%20Telegram%20Channel-0088CC?style=plastic&logo=telegram&logoColor=white&labelColor=0A3D62" width="250"></a>
-
-#### ***⚡️ Download Anything. Upload Everywhere. 🔥***
-
----
-
-### <img src="https://graph.org/file/504ba776ef0724a4ae85b.png" width="25" alt="Google Colab Logo"> Google Colab : [Deploy Link](https://colab.research.google.com/drive/1ntoqoj3jDq2FtU2-joizh0DO64uoec9q)
-
-</div>
-
----
-
-## 📌 Key Highlights
-
-<details>
-  <summary><strong>View All Highlights  <kbd>Click Here</kbd></strong></summary>
-
----
 
 _KPSML-X is designed to make file management seamless, fast, and flexible._
 
@@ -52,55 +18,18 @@ _KPSML-X is designed to make file management seamless, fast, and flexible._
 
 - **💨 Lightweight Performance** - Optimized Python & Pyrogram async engine for speed.  
 
-- **💬 Active Community Support** - Join **[@KPSBots](https://telegram.me/KPSBots)** for updates and help.
-
 </details>
 
 ---
 
 ## 🚀 Deployment Guide (VPS)
 
-<details>
-  <summary><strong>View All Steps  <kbd>Click Here</kbd></strong></summary>
 
----
-
-## 1. Prerequisites
-
-- **Tutorial Video from A to Z (Latest Video)**
-- Special thanks to [Wiszky](https://github.com/vishnoe115)
-
-[![See Video](https://img.shields.io/badge/See%20Video-black?style=for-the-badge&logo=YouTube)](https://youtu.be/xzLOLyKYl54)
-
----
-
-## 2. Installing Requirements
+#Installing Requirements
 
 Clone this repository:
 
-```bash
-git clone https://github.com/Tamilupdates/KPSML-X kpsml-x && cd kpsml-x
-```
-
-Setting up config file:
-    
-```
-cp config_sample.env config.env
-```
-
-- Remove the first line saying:
-
-```
-_____REMOVE_THIS_LINE_____=True
-```
-
-_Fill up rest of the fields. Meaning of each field is discussed below._
-
-**NOTE**: All values must be filled between quotes, even if it's `Int`, `Bool` or `List`.
-
----
-
-## 3. Build and Run the Docker Image
+ Build and Run the Docker Image
 
 *Make sure you mount the app folder and install Docker following the official documentation.*
 
@@ -214,155 +143,6 @@ sudo docker image prune -a
 
 ---
 
-## 🚀 Deployment Guide (Heroku CLI)
-<details>
-  <summary><strong>View All Steps  <kbd>Click Here</kbd></strong></summary>
-  
----
-  
-**Step 1 :** Git clone this Repo and change directory
-
-> Make sure git is Installed in your system or quick run `apt-get install git pip curl -y`
-
-```shell
-git clone https://github.com/Tamilupdates/KPSML-X kpsml-x && cd kpsml-x 
-```
-
----
-
-**Step 2 :** Now Install Heroku in your Sytem or checkout Official Heroku Deploy Docs, or Download via `apt-get` or `npm`
-
-> For Android : Use `termux` (Download via FDroid) for CLI usage
-
-**The script requires sudo and isn’t Windows compatible.**
-
-```shell
-curl https://cli-assets.heroku.com/install.sh | sh
-```
-
-**Install with Ubuntu / Debian apt-get**
-
-```shell
-curl https://cli-assets.heroku.com/install-ubuntu.sh | sh
-```
-
-**Install via `npm` (Not Recommanded)**
-
-```shell
-npm install -g heroku
-```
-
-**Official Heroku Install Guide :** [Check Here](https://devcenter.heroku.com/articles/heroku-cli#install-the-heroku-cli)
-
----
-
-**Step 3 :** Login into Heroku and Log In CLI via Browser 
-
-_With Browser_
-
-```shell
-heroku login
-```
-
-**OR**
-
-_Without Browser_
-
-```shell
-heroku login -i
-```
-
-- Put `Heroku Email` : Heroku Email `email@example.com`
-
-- Put `Heroku Password` : Heroku API Key. Get from [Here](https://dashboard.heroku.com/account)
-
----
-
-**Step 4 :** Create Heroku App and specify stack and region with App Name
-
-```shell
-heroku create --region us --stack container APP_NAME
-```
-
-**To Be Noted**: Copy the `BASE_URL` after the App is Created and Put the Value in `BASE_URL` when editing `config.env`
-
-**Notes:**
-- `--region us` for United States Server.
-
-- `--region eu` for Europe Server.
-
-- `APP_NAME` should be replaced with your unique app name _(Optional)_. If not given it generates a random name.
-
-- `--stack container` for setting stack to container for Dockerfile.
-
-- `--buildpack heroku/python` for using build slug for repo deploy and build.
-
----
-
-**Step 5 :** Now set all the Required Variables and Files into this Branch MAIN Repo like config.env, accounts.zip, token.pickle, All Private Files(optional)- 
-
-  > Only config.env Mabdatory with Only Mandatory Vars Only, After that Put all Private Files or Vars via Bot Settings `/bs`
-
-**To Edit Inside CLI (nano Editor):** _(Termux Users)_
-
-```shell
-nano config.env
-```
-
-- **Sample config.env** _(Copy these and Paste in Editor and Fill Up)_
-  ```
-  BOT_TOKEN = ""
-  TELEGRAM_API = ""
-  TELEGRAM_HASH = ""
-  OWNER_ID = ""
-  DATABASE_URL = ""
-  BASE_URL = ""
-  SET_COMMANDS = "True"
-  UPSTREAM_REPO = "https://github.com/Tamilupdates/KPSML-X"
-  UPSTREAM_BRANCH = "kpsmlx"
-  ```
-- After Setup Exit from Editor via `CTRL + X`, followed via `y` and `Enter`...
-
-**Helpful Commands:**
-
-- **Exit from nano** : `CTRL + X`
-- **Save File** : `CTRL + S`
-- **Check Help** : `CTRL + G`
-- **Undo Changes** : `ALT + U`
-- ^ means CTRL _(Termux Users)_
-
----
-
-**Step 6 :** Set Local git remote for Heroku. Give All Commands One by One.
-
-```shell
-git add . -f
-git commit -m "HK Setup"
-heroku git:remote -a APP_NAME
-```
-
----
-
-**Step 7 :** Now push to Heroku via git forcefully to build.
-
-```shell
-git push heroku main -f
-```
-
-**Heroku Logs:** When checking Logs, Use this will give Complete Logs.
-
-```shell
-heroku logs -a APP_NAME
-```
-
-- Add arg `-t` for Live Stream Logs and Use `CTRL + C` to Exit from it.
-
----
-
-**All Heroku CLI Commands :** [Click Here](https://devcenter.heroku.com/articles/heroku-cli-commands#heroku-config-set)
-</details>
-
----
 
 ## 🛠️ Variables Descriptions
 
@@ -393,9 +173,3 @@ heroku logs -a APP_NAME
 
 </details>
 
----
-
-## 🌿 Branch Specifications
-
-- All files to be Uploaded in `main` Branch and set Upstream as `kpsmlx` Branch.
-- View the **Upstream Branch**: **[kpsmlx](https://github.com/Tamilupdates/KPSML-X/tree/kpsmlx)**
