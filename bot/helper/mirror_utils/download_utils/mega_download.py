@@ -2,7 +2,7 @@
 from random import choice as random_choice
 from secrets import token_hex
 from aiofiles.os import makedirs
-from asyncio import Event, sleep, create_task
+from asyncio import Event, sleep, create_task, CancelledError
 from mega import MegaApi, MegaListener, MegaRequest, MegaTransfer, MegaError
 
 try:
@@ -293,6 +293,15 @@ async def add_mega_download(mega_link, path, listener, name):
 
         break  # Login / fetch succeeded
 
+    # Guard against a None node when the MEGA SDK reports no error but the
+    # link is expired, deleted or otherwise unreachable.
+    if node is None:
+        await sendMessage(listener.message, "❌ Mega link is invalid or the file/folder no longer exists.")
+        await executor.do(api.logout, ())
+        if folder_api is not None:
+            await executor.do(folder_api.logout, ())
+        return
+
     name = name or node.getName()
     msg, button = await stop_duplicate_check(name, listener)
     if msg:
@@ -306,6 +315,9 @@ async def add_mega_download(mega_link, path, listener, name):
     size = api.getSize(node)
     if limit_exceeded := await limit_checker(size, listener, isMega=True):
         await sendMessage(listener.message, limit_exceeded)
+        await executor.do(api.logout, ())
+        if folder_api is not None:
+            await executor.do(folder_api.logout, ())
         return
     added_to_queue, event = await is_queued(listener.uid)
     if added_to_queue:
@@ -366,7 +378,7 @@ async def add_mega_download(mega_link, path, listener, name):
             watchdog.cancel()
             try:
                 await watchdog
-            except Exception:
+            except CancelledError:
                 pass
 
         if mega_listener.is_quota_error:
