@@ -175,6 +175,10 @@ class MirrorLeechListener:
                     else:
                         await move(item_path, f'{des_path}/{item}')
                 multi_links = True
+            if self.uid not in download_dict:
+                # Task was already completed and cleaned up (e.g. duplicate
+                # onTransferFinish callback from the MEGA SDK).  Silently bail.
+                return
             download = download_dict[self.uid]
             name = str(download.name()).replace('/', '')
             gid = download.gid()

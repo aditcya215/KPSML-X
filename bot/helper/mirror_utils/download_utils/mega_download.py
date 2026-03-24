@@ -38,6 +38,13 @@ class MegaAppListener(MegaListener):
         # Generation counter: incremented on each proxy-rotation retry so that
         # callbacks belonging to a stale/cancelled transfer are silently dropped.
         self._dl_gen = 0
+        # One-shot flag: ensures onDownloadComplete is called at most once per
+        # download attempt.  The MEGA SDK can fire onTransferFinish twice for
+        # the same transfer (e.g. file-level and folder-level completions), so
+        # without this guard a second callback would re-enter onDownloadComplete
+        # after the task has already been cleaned up, causing a KeyError on
+        # download_dict[uid].  Reset to False on each proxy-rotation retry.
+        self._download_done = False
         super().__init__()
 
     @property
@@ -84,15 +91,24 @@ class MegaAppListener(MegaListener):
         self.__bytes_transferred = transfer.getTransferredBytes()
 
     def onTransferFinish(self, api: MegaApi, transfer: MegaTransfer, error):
+        # Snapshot the generation counter at callback-entry time.  The asyncio
+        # event loop can increment _dl_gen (proxy rotation) between here and the
+        # conditional check below; comparing the snapshot against the live value
+        # lets us detect and discard stale callbacks from superseded transfers.
         gen = self._dl_gen
         try:
             if self.is_cancelled:
                 self.continue_event.set()
             elif (
-                gen == self._dl_gen
+                not self._download_done
+                and gen == self._dl_gen
                 and transfer.isFinished()
                 and (transfer.isFolderTransfer() or transfer.getFileName() == self.__name)
             ):
+                # Set the flag before calling onDownloadComplete so that any
+                # duplicate onTransferFinish callback (MEGA SDK can fire it
+                # twice for the same transfer) is silently ignored.
+                self._download_done = True
                 try:
                     async_to_sync(self.listener.onDownloadComplete)
                 except Exception as e:
@@ -106,6 +122,8 @@ class MegaAppListener(MegaListener):
             self.continue_event.set()
 
     def onTransferTemporaryError(self, api, transfer, error):
+        # Snapshot generation at entry so a concurrent _dl_gen increment (proxy
+        # rotation) is detectable; see onTransferFinish for the same pattern.
         gen = self._dl_gen
         filen = transfer.getFileName()
         state = transfer.getState()
@@ -377,6 +395,7 @@ async def add_mega_download(mega_link, path, listener, name):
             mega_listener.is_quota_error = False
             mega_listener.is_stalled = False
             mega_listener.error = None
+            mega_listener._download_done = False
 
             # Run the stall watchdog concurrently with the download so that a
             # proxy bandwidth exhaustion (which stalls silently) is detected and
