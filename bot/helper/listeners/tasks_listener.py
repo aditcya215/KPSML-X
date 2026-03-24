@@ -175,6 +175,10 @@ class MirrorLeechListener:
                     else:
                         await move(item_path, f'{des_path}/{item}')
                 multi_links = True
+            if self.uid not in download_dict:
+                # Task was already completed and cleaned up (e.g. duplicate
+                # onTransferFinish callback from the MEGA SDK).  Silently bail.
+                return
             download = download_dict[self.uid]
             name = str(download.name()).replace('/', '')
             gid = download.gid()
@@ -188,8 +192,14 @@ class MirrorLeechListener:
             except Exception as e:
                 await self.onUploadError(str(e))
                 return
+            if not files:
+                await self.onUploadError(f"Downloaded file not found in destination directory: {self.dir}")
+                return
             name = files[-1]
             if name == "yt-dlp-thumb":
+                if len(files) < 2:
+                    await self.onUploadError(f"No download found, only thumbnail file present in: {self.dir}")
+                    return
                 name = files[0]
 
         dl_path = f"{self.dir}/{name}"

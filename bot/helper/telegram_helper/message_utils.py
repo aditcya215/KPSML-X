@@ -296,12 +296,15 @@ async def update_all_messages(force=False):
         return
     async with status_reply_dict_lock:
         for chat_id in list(status_reply_dict.keys()):
-            if status_reply_dict[chat_id] and msg != status_reply_dict[chat_id][0].text:
-                rmsg = await editMessage(status_reply_dict[chat_id][0], msg, buttons, 'IMAGES')
+            # status_reply_dict[chat_id] = [msg_obj_or_str, timestamp].
+            # Use `or [None]` guard to handle an empty-list entry without IndexError.
+            stored_msg = (status_reply_dict.get(chat_id) or [None])[0]
+            if stored_msg and not isinstance(stored_msg, str) and msg != stored_msg.text:
+                rmsg = await editMessage(stored_msg, msg, buttons, 'IMAGES')
                 if isinstance(rmsg, str) and rmsg.startswith('Telegram says: [400'):
                     del status_reply_dict[chat_id]
                     continue
-                status_reply_dict[chat_id][0].text = msg
+                stored_msg.text = msg
                 status_reply_dict[chat_id][1] = time()
 
 
@@ -316,7 +319,8 @@ async def sendStatusMessage(msg):
             message = status_reply_dict[chat_id][0]
             await deleteMessage(message)
             del status_reply_dict[chat_id]
-        if message := await sendMessage(msg, progress, buttons, photo='IMAGES'):
+        message = await sendMessage(msg, progress, buttons, photo='IMAGES')
+        if message and not isinstance(message, str):
             if hasattr(message, 'caption'):
                 message.caption = progress
             else:

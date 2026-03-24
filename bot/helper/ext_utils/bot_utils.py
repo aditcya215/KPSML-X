@@ -68,7 +68,10 @@ class setInterval:
     async def __set_interval(self):
         while True:
             await sleep(self.interval)
-            await self.action()
+            try:
+                await self.action()
+            except Exception as e:
+                LOGGER.error(f"setInterval action error ({getattr(self.action, '__name__', self.action)}): {e}")
 
     def cancel(self):
         self.task.cancel()

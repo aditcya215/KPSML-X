@@ -2,7 +2,7 @@
 from random import choice as random_choice
 from secrets import token_hex
 from aiofiles.os import makedirs
-from asyncio import Event
+from asyncio import Event, sleep, create_task, CancelledError
 from mega import MegaApi, MegaListener, MegaRequest, MegaTransfer, MegaError
 
 try:
@@ -30,10 +30,21 @@ class MegaAppListener(MegaListener):
         self.listener = listener
         self.is_cancelled = False
         self.is_quota_error = False
+        self.is_stalled = False
         self.error = None
         self.__bytes_transferred = 0
         self.__speed = 0
         self.__name = ''
+        # Generation counter: incremented on each proxy-rotation retry so that
+        # callbacks belonging to a stale/cancelled transfer are silently dropped.
+        self._dl_gen = 0
+        # One-shot flag: ensures onDownloadComplete is called at most once per
+        # download attempt.  The MEGA SDK can fire onTransferFinish twice for
+        # the same transfer (e.g. file-level and folder-level completions), so
+        # without this guard a second callback would re-enter onDownloadComplete
+        # after the task has already been cleaned up, causing a KeyError on
+        # download_dict[uid].  Reset to False on each proxy-rotation retry.
+        self._download_done = False
         super().__init__()
 
     @property
@@ -66,12 +77,10 @@ class MegaAppListener(MegaListener):
 
     def onRequestTemporaryError(self, api, request, error: MegaError):
         LOGGER.error(f'Mega Request error in {error}')
-        if not self.is_cancelled:
-            self.is_cancelled = True
-            async_to_sync(self.listener.onDownloadError,
-                          f"RequestTempError: {error.toString()}")
-        self.error = error.toString()
-        self.continue_event.set()
+        # Temporary error; MEGA SDK retries the request internally.
+        # onRequestFinish (above) will be called with the final outcome – do NOT
+        # cancel the download or set the continue_event here.
+        pass
 
     def onTransferUpdate(self, api: MegaApi, transfer: MegaTransfer):
         if self.is_cancelled:
@@ -82,36 +91,65 @@ class MegaAppListener(MegaListener):
         self.__bytes_transferred = transfer.getTransferredBytes()
 
     def onTransferFinish(self, api: MegaApi, transfer: MegaTransfer, error):
+        # Snapshot the generation counter at callback-entry time.  The asyncio
+        # event loop can increment _dl_gen (proxy rotation) between here and the
+        # conditional check below; comparing the snapshot against the live value
+        # lets us detect and discard stale callbacks from superseded transfers.
+        gen = self._dl_gen
         try:
             if self.is_cancelled:
                 self.continue_event.set()
-            elif transfer.isFinished() and (transfer.isFolderTransfer() or transfer.getFileName() == self.__name):
-                async_to_sync(self.listener.onDownloadComplete)
-                self.continue_event.set()
+            elif (
+                not self._download_done
+                and gen == self._dl_gen
+                and transfer.isFinished()
+                and (transfer.isFolderTransfer() or transfer.getFileName() == self.__name)
+            ):
+                # Set the flag before calling onDownloadComplete so that any
+                # duplicate onTransferFinish callback (MEGA SDK can fire it
+                # twice for the same transfer) is silently ignored.
+                self._download_done = True
+                try:
+                    async_to_sync(self.listener.onDownloadComplete)
+                except Exception as e:
+                    LOGGER.error(f"onDownloadComplete raised: {e}")
+                finally:
+                    # Always unblock the executor so executor.do() doesn't hang
+                    # forever when onDownloadComplete raises an exception.
+                    self.continue_event.set()
         except Exception as e:
             LOGGER.error(e)
+            self.continue_event.set()
 
     def onTransferTemporaryError(self, api, transfer, error):
+        # Snapshot generation at entry so a concurrent _dl_gen increment (proxy
+        # rotation) is detectable; see onTransferFinish for the same pattern.
+        gen = self._dl_gen
         filen = transfer.getFileName()
         state = transfer.getState()
         errStr = error.toString()
-        LOGGER.error(
-            f'Mega download error in file {transfer} {filen}: {error}')
         if state in [1, 4]:
             # Sometimes MEGA (offical client) can't stream a node either and raises a temp failed error.
             # Don't break the transfer queue if transfer's in queued (1) or retrying (4) state [causes seg fault]
             return
+        if self.is_cancelled:
+            # Already handled; suppress duplicate error logs for the same transfer failure.
+            return
+        if gen != self._dl_gen:
+            # Stale callback from a superseded transfer; drop it.
+            return
 
+        LOGGER.error(
+            f'Mega download error in file {transfer} {filen}: {error}')
         self.error = errStr
-        if not self.is_cancelled:
-            self.is_cancelled = True
-            if 'quota' in errStr.lower():
-                self.is_quota_error = True
-                self.continue_event.set()
-            else:
-                async_to_sync(self.listener.onDownloadError,
-                              f"TransferTempError: {errStr} ({filen})")
-                self.continue_event.set()
+        self.is_cancelled = True
+        if 'quota' in errStr.lower():
+            self.is_quota_error = True
+            self.continue_event.set()
+        else:
+            async_to_sync(self.listener.onDownloadError,
+                          f"TransferTempError: {errStr} ({filen})")
+            self.continue_event.set()
 
     async def cancel_download(self):
         self.is_cancelled = True
@@ -129,6 +167,52 @@ class AsyncExecutor:
         await self.continue_event.wait()
 
 
+# Stall detection: rotate proxy when download makes no progress for this long.
+_STALL_TIMEOUT = 60    # seconds of zero progress before treating as a stall
+_STALL_CHECK   = 10    # polling interval in seconds
+
+
+async def _stall_watchdog(mega_listener, api, timeout=_STALL_TIMEOUT, interval=_STALL_CHECK):
+    """Detect mid-transfer proxy bandwidth stalls and trigger proxy rotation.
+
+    When the proxy hits its bandwidth cap the TCP connection stays open but no
+    data flows.  The MEGA SDK never fires a quota error in this case – it just
+    waits indefinitely.  This watchdog polls `downloaded_bytes` every
+    `interval` seconds and, if there has been no progress for `timeout`
+    seconds, marks the transfer as a quota/stall error so the outer loop can
+    rotate to the next proxy.
+    """
+    last_bytes = None
+    stall_elapsed = 0
+    while not mega_listener.is_cancelled:
+        await sleep(interval)
+        if mega_listener.is_cancelled:
+            break
+        current_bytes = mega_listener.downloaded_bytes
+        if last_bytes is None:
+            # First observation – just record the baseline.
+            last_bytes = current_bytes
+            continue
+        if current_bytes == last_bytes:
+            stall_elapsed += interval
+            if stall_elapsed >= timeout:
+                LOGGER.warning(
+                    f"MEGA download stalled for {stall_elapsed}s "
+                    f"(proxy bandwidth limit?), triggering proxy rotation"
+                )
+                mega_listener.is_stalled = True
+                mega_listener.is_quota_error = True
+                mega_listener.is_cancelled = True
+                # Immediately unblock the executor.  onTransferUpdate also sets
+                # is_cancelled=True and calls api.cancelTransfer on its next
+                # invocation (MEGA SDK timer), but we don't wait for that.
+                mega_listener.continue_event.set()
+                break
+        else:
+            stall_elapsed = 0
+            last_bytes = current_bytes
+
+
 def _apply_mega_proxy(api, mega_proxy_url):
     """Configure proxy settings on a MegaApi instance.
 
@@ -143,9 +227,11 @@ def _apply_mega_proxy(api, mega_proxy_url):
             proxy = MegaProxy()
             if hasattr(proxy, 'setType') and hasattr(MegaProxy, 'PROXY_CUSTOM'):
                 proxy.setType(MegaProxy.PROXY_CUSTOM)
-            proxy.setURL(mega_proxy_url)
-            api.setProxySettings(proxy)
-            return True
+            if hasattr(proxy, 'setURL'):
+                proxy.setURL(mega_proxy_url)
+                api.setProxySettings(proxy)
+                return True
+            # setURL not available in this SDK build; fall through to env vars.
         except Exception as e:
             LOGGER.warning(
                 f"MegaProxy SDK error ({e}), falling back to environment variables for {mega_proxy_url}"
@@ -175,118 +261,195 @@ async def add_mega_download(mega_link, path, listener, name):
     api = MegaApi(None, None, None, 'KPSML-X')
     folder_api = None
 
-    if current_proxy and _apply_mega_proxy(api, current_proxy):
-        LOGGER.info(f"MEGA proxy mode enabled: {current_proxy}")
+    try:
+        # --- Login / fetch-nodes phase with per-proxy retry ---
+        node = None
+        while True:
+            if current_proxy and _apply_mega_proxy(api, current_proxy):
+                LOGGER.info(f"MEGA proxy mode enabled: {current_proxy}")
 
-    mega_listener = MegaAppListener(executor.continue_event, listener)
-    api.addListener(mega_listener)
+            mega_listener = MegaAppListener(executor.continue_event, listener)
+            api.addListener(mega_listener)
 
-    if MEGA_EMAIL and MEGA_PASSWORD:
-        await executor.do(api.login, (MEGA_EMAIL, MEGA_PASSWORD))
+            if MEGA_EMAIL and MEGA_PASSWORD:
+                await executor.do(api.login, (MEGA_EMAIL, MEGA_PASSWORD))
 
-    if get_mega_link_type(mega_link) == "file":
-        await executor.do(api.getPublicNode, (mega_link,))
-        node = mega_listener.public_node
-    else:
-        folder_api = MegaApi(None, None, None, 'KPSML-X')
-        if current_proxy:
-            _apply_mega_proxy(folder_api, current_proxy)
-        folder_api.addListener(mega_listener)
-        await executor.do(folder_api.loginToFolder, (mega_link,))
-        node = await sync_to_async(folder_api.authorizeNode, mega_listener.node)
-    if mega_listener.error is not None:
-        await sendMessage(listener.message, str(mega_listener.error))
-        await executor.do(api.logout, ())
-        if folder_api is not None:
-            await executor.do(folder_api.logout, ())
-        return
-
-    name = name or node.getName()
-    msg, button = await stop_duplicate_check(name, listener)
-    if msg:
-        await sendMessage(listener.message, msg, button)
-        await executor.do(api.logout, ())
-        if folder_api is not None:
-            await executor.do(folder_api.logout, ())
-        return
-
-    gid = token_hex(5)
-    size = api.getSize(node)
-    if limit_exceeded := await limit_checker(size, listener, isMega=True):
-        await sendMessage(listener.message, limit_exceeded)
-        return
-    added_to_queue, event = await is_queued(listener.uid)
-    if added_to_queue:
-        LOGGER.info(f"Added to Queue/Download: {name}")
-        async with download_dict_lock:
-            download_dict[listener.uid] = QueueStatus(
-                name, size, gid, listener, 'Dl')
-        await listener.onDownloadStart()
-        await sendStatusMessage(listener.message)
-        await event.wait()
-        async with download_dict_lock:
-            if listener.uid not in download_dict:
-                await executor.do(api.logout, ())
-                if folder_api is not None:
-                    await executor.do(folder_api.logout, ())
-                return
-        from_queue = True
-        LOGGER.info(f'Start Queued Download from Mega: {name}')
-    else:
-        from_queue = False
-
-    async with download_dict_lock:
-        download_dict[listener.uid] = MegaDownloadStatus(name, size, gid, mega_listener, listener.message, listener.upload_details)
-    async with queue_dict_lock:
-        non_queued_dl.add(listener.uid)
-
-    if from_queue:
-        LOGGER.info(f'Start Queued Download from Mega: {name}')
-    else:
-        await listener.onDownloadStart()
-        await sendStatusMessage(listener.message)
-        LOGGER.info(f"Download from Mega: {name}")
-
-    await makedirs(path, exist_ok=True)
-
-    while True:
-        # Safety check: abort if the task was externally removed (e.g. user cancel).
-        async with download_dict_lock:
-            if listener.uid not in download_dict:
-                await executor.do(api.logout, ())
-                if folder_api is not None:
-                    await executor.do(folder_api.logout, ())
-                return
-
-        # Reset listener state for this download attempt.
-        mega_listener.is_cancelled = False
-        mega_listener.is_quota_error = False
-        mega_listener.error = None
-
-        await executor.do(api.startDownload, (node, path, name, None, False, None))
-
-        if mega_listener.is_quota_error:
-            if current_proxy:
-                tried_proxies.add(current_proxy)
-            remaining = [p for p in proxy_list if p not in tried_proxies]
-            if remaining:
-                current_proxy = random_choice(remaining)
-                LOGGER.warning(
-                    f"Quota exceeded, rotating to new proxy: {current_proxy}"
-                )
-                _apply_mega_proxy(api, current_proxy)
-                if folder_api is not None:
+            if get_mega_link_type(mega_link) == "file":
+                await executor.do(api.getPublicNode, (mega_link,))
+                node = mega_listener.public_node
+            else:
+                folder_api = MegaApi(None, None, None, 'KPSML-X')
+                if current_proxy:
                     _apply_mega_proxy(folder_api, current_proxy)
-                continue
-            LOGGER.error("Quota exceeded on all available proxies")
-            await listener.onDownloadError("Mega download failed: Over quota on all proxies")
+                folder_api.addListener(mega_listener)
+                await executor.do(folder_api.loginToFolder, (mega_link,))
+                # Guard against authorizeNode(None) when login failed.
+                if mega_listener.error is None and mega_listener.node is not None:
+                    node = await sync_to_async(folder_api.authorizeNode, mega_listener.node)
+                else:
+                    node = None
+
+            if mega_listener.error is not None:
+                # Login/fetch failed – try the next proxy if one is available.
+                if current_proxy:
+                    tried_proxies.add(current_proxy)
+                remaining = [p for p in proxy_list if p not in tried_proxies]
+                if remaining:
+                    current_proxy = random_choice(remaining)
+                    LOGGER.warning(
+                        f"Mega login failed ({mega_listener.error}), "
+                        f"rotating to next proxy: {current_proxy}"
+                    )
+                    # Clean up the failed session before retrying.
+                    await executor.do(api.logout, ())
+                    api.removeListener(mega_listener)
+                    if folder_api is not None:
+                        await executor.do(folder_api.logout, ())
+                        folder_api.removeListener(mega_listener)
+                        folder_api = None
+                    # Fresh executor / API object for the next attempt.
+                    executor = AsyncExecutor()
+                    api = MegaApi(None, None, None, 'KPSML-X')
+                    continue
+
+                # All proxies exhausted – report the error and bail out.
+                await sendMessage(listener.message, str(mega_listener.error))
+                await executor.do(api.logout, ())
+                if folder_api is not None:
+                    await executor.do(folder_api.logout, ())
+                return
+
+            break  # Login / fetch succeeded
+
+        # Guard against a None node when the MEGA SDK reports no error but the
+        # link is expired, deleted or otherwise unreachable.
+        if node is None:
+            await sendMessage(listener.message, "❌ Mega link is invalid or the file/folder no longer exists.")
             await executor.do(api.logout, ())
             if folder_api is not None:
                 await executor.do(folder_api.logout, ())
             return
 
-        break
+        name = name or node.getName()
+        msg, button = await stop_duplicate_check(name, listener)
+        if msg:
+            await sendMessage(listener.message, msg, button)
+            await executor.do(api.logout, ())
+            if folder_api is not None:
+                await executor.do(folder_api.logout, ())
+            return
 
-    await executor.do(api.logout, ())
-    if folder_api is not None:
-        await executor.do(folder_api.logout, ())
+        gid = token_hex(5)
+        size = api.getSize(node)
+        if limit_exceeded := await limit_checker(size, listener, isMega=True):
+            await sendMessage(listener.message, limit_exceeded)
+            await executor.do(api.logout, ())
+            if folder_api is not None:
+                await executor.do(folder_api.logout, ())
+            return
+        added_to_queue, event = await is_queued(listener.uid)
+        if added_to_queue:
+            LOGGER.info(f"Added to Queue/Download: {name}")
+            async with download_dict_lock:
+                download_dict[listener.uid] = QueueStatus(
+                    name, size, gid, listener, 'Dl')
+            await listener.onDownloadStart()
+            await sendStatusMessage(listener.message)
+            await event.wait()
+            async with download_dict_lock:
+                if listener.uid not in download_dict:
+                    await executor.do(api.logout, ())
+                    if folder_api is not None:
+                        await executor.do(folder_api.logout, ())
+                    return
+            from_queue = True
+            LOGGER.info(f'Start Queued Download from Mega: {name}')
+        else:
+            from_queue = False
+
+        async with download_dict_lock:
+            download_dict[listener.uid] = MegaDownloadStatus(name, size, gid, mega_listener, listener.message, listener.upload_details)
+        async with queue_dict_lock:
+            non_queued_dl.add(listener.uid)
+
+        if from_queue:
+            LOGGER.info(f'Start Queued Download from Mega: {name}')
+        else:
+            await listener.onDownloadStart()
+            await sendStatusMessage(listener.message)
+            LOGGER.info(f"Download from Mega: {name}")
+
+        await makedirs(path, exist_ok=True)
+
+        while True:
+            # Safety check: abort if the task was externally removed (e.g. user cancel).
+            async with download_dict_lock:
+                if listener.uid not in download_dict:
+                    await executor.do(api.logout, ())
+                    if folder_api is not None:
+                        await executor.do(folder_api.logout, ())
+                    return
+
+            # Reset listener state for this download attempt.
+            mega_listener.is_cancelled = False
+            mega_listener.is_quota_error = False
+            mega_listener.is_stalled = False
+            mega_listener.error = None
+            mega_listener._download_done = False
+
+            # Run the stall watchdog concurrently with the download so that a
+            # proxy bandwidth exhaustion (which stalls silently) is detected and
+            # handled via the same proxy-rotation path as quota errors.
+            watchdog = create_task(_stall_watchdog(mega_listener, api))
+            try:
+                await executor.do(api.startDownload, (node, path, name, None, False, None))
+            finally:
+                watchdog.cancel()
+                try:
+                    await watchdog
+                except CancelledError:
+                    pass
+
+            if mega_listener.is_quota_error:
+                if current_proxy:
+                    tried_proxies.add(current_proxy)
+                remaining = [p for p in proxy_list if p not in tried_proxies]
+                if remaining:
+                    current_proxy = random_choice(remaining)
+                    reason = "stalled (proxy bandwidth limit?)" if mega_listener.is_stalled else "quota exceeded"
+                    LOGGER.warning(
+                        f"MEGA transfer {reason}, rotating to new proxy: {current_proxy}"
+                    )
+                    _apply_mega_proxy(api, current_proxy)
+                    if folder_api is not None:
+                        _apply_mega_proxy(folder_api, current_proxy)
+                    # Increment the generation counter so that any lingering
+                    # callbacks from the cancelled transfer are silently ignored.
+                    mega_listener._dl_gen += 1
+                    continue
+                LOGGER.error("Quota exceeded / stalled on all available proxies")
+                await listener.onDownloadError("Mega download failed: Over quota or stalled on all proxies")
+                await executor.do(api.logout, ())
+                if folder_api is not None:
+                    await executor.do(folder_api.logout, ())
+                return
+
+            break
+
+        await executor.do(api.logout, ())
+        if folder_api is not None:
+            await executor.do(folder_api.logout, ())
+
+    except Exception as e:
+        LOGGER.error(f"Unhandled exception in add_mega_download: {e}", exc_info=True)
+        # Best-effort cleanup so MEGA SDK background threads don't linger.
+        try:
+            await executor.do(api.logout, ())
+        except Exception:
+            pass
+        if folder_api is not None:
+            try:
+                await executor.do(folder_api.logout, ())
+            except Exception:
+                pass
+        await listener.onDownloadError(f"Mega download error: {e}")
